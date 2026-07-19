@@ -1,0 +1,26 @@
+# macOS metadata
+.DS_Store
+
+# Python artifacts
+__pycache__/
+*.pyc
+
+# logs / runtime outputs
+*.log
+*.pid
+logs/
+output/
+results/
+results_rf/
+results_rf_linear_mlp/
+results_rf_jepa_smoke/
+results_two_video/
+results_vjepa_cache_stride16/
+
+# dataset + bulky media (keep code-only repo in GitHub)
+*.mp4
+*.mkv
+*.mov
+*.avi
+wearable-ai-lite2/starter_kit/.env
+wearable-ai-lite2/.git.disabled/
