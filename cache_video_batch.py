@@ -7,6 +7,7 @@ import cv2
 import json
 import re
 import time
+import torch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,6 +30,12 @@ def parse_args():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--window-frames", type=int, default=None)
     parser.add_argument("--stride-frames", type=int, default=None)
+    parser.add_argument(
+        "--target-fps",
+        type=float,
+        default=None,
+        help="Temporally sample the source at this FPS before windowing.",
+    )
     parser.add_argument(
         "--feature-batch-size",
         type=int,
@@ -65,7 +72,15 @@ def load_encoder(name, device):
         return None
     model = AutoModel.from_pretrained(ENCODER_PRESETS[name])
     encoder = model.vjepa2 if name == "vjepa2" and hasattr(model, "vjepa2") else model
-    encoder.requires_grad_(False).eval().to(device)
+    encoder.requires_grad_(False).eval()
+    if (
+        name == "vjepa2"
+        and device.type == "cuda"
+        and torch.cuda.is_bf16_supported()
+    ):
+        encoder.to(device=device, dtype=torch.bfloat16)
+    else:
+        encoder.to(device)
     return encoder
 
 
@@ -120,6 +135,7 @@ def main():
         window_frames=window_frames,
         stride_frames=stride_frames,
         max_seconds=None,
+        target_fps=args.target_fps,
         feature_batch_size=args.feature_batch_size,
         flow_grid_h=16,
         flow_grid_w=12,

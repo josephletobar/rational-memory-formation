@@ -10,8 +10,10 @@ Annotations are adjacent ``VIDEO.mp4.clipme.json`` files in the data directory.
 
 import argparse
 import json
+import os
 import random
 import re
+import subprocess
 import time
 from collections import deque
 from pathlib import Path
@@ -144,6 +146,16 @@ def parse_args():
         "--cached-only",
         action="store_true",
         help="Use only videos with an exact existing feature cache; never load an encoder or compute features.",
+    )
+    p.add_argument(
+        "--extract-only",
+        action="store_true",
+        help="Populate/load feature caches, then exit without fitting a probe.",
+    )
+    p.add_argument(
+        "--fit-all",
+        action="store_true",
+        help="Fit the requested probe on every loaded video and save it; no held-out metrics are reported.",
     )
     p.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
     p.add_argument(
@@ -323,6 +335,61 @@ def prepare_frame(frame, size=256):
     return cv2.cvtColor(resized[y : y + size, x : x + size], cv2.COLOR_BGR2RGB)
 
 
+def ffmpeg_prepared_frames(video, width, height, source_fps, target_fps, size=256):
+    """Yield RGB eval frames using NVDEC and an optimized FFmpeg filter graph."""
+    short_side = round(size * 256 / 224)
+    scale = short_side / min(height, width)
+    scaled_width = round(width * scale)
+    scaled_height = round(height * scale)
+    crop_x = (scaled_width - size) // 2
+    crop_y = (scaled_height - size) // 2
+    filters = ["hwdownload", "format=nv12", "format=bgr24"]
+    if abs(source_fps - target_fps) > 1e-3:
+        filters.append(f"fps={target_fps:.12g}")
+    filters.extend([
+        f"scale={scaled_width}:{scaled_height}:flags=bilinear",
+        f"crop={size}:{size}:{crop_x}:{crop_y}",
+        "format=rgb24",
+    ])
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+        "-i", str(video), "-an", "-vf", ",".join(filters),
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+    ]
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        bufsize=size * size * 3 * 8,
+    )
+    frame_bytes = size * size * 3
+    try:
+        while True:
+            chunks = []
+            remaining = frame_bytes
+            while remaining:
+                chunk = process.stdout.read(remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if remaining:
+                break
+            yield np.frombuffer(b"".join(chunks), dtype=np.uint8).reshape(
+                size, size, 3
+            )
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+        return_code = process.wait()
+        if return_code:
+            raise RuntimeError(
+                f"FFmpeg hardware frame pipe failed for {video} "
+                f"(exit {return_code})"
+            )
+
+
 def encode_batch(clips, encoder, device, encoder_name, flow_args=None):
     if encoder_name == "optical_flow":
         if len(clips) != 1:
@@ -351,8 +418,22 @@ def encode_batch(clips, encoder, device, encoder_name, flow_args=None):
 
     pixels = np.stack(clips).astype(np.float32) / 255.0  # B,T,H,W,C
     pixels = (pixels - IMAGENET_MEAN) / IMAGENET_STD
-    pixels = torch.from_numpy(pixels).permute(0, 1, 4, 2, 3).to(device)
-    with torch.inference_mode():
+    pixels = torch.from_numpy(pixels).permute(0, 1, 4, 2, 3)
+    if encoder_name == "vjepa2":
+        model_dtype = next(encoder.parameters()).dtype
+        pixels = pixels.to(device=device, dtype=model_dtype)
+    else:
+        pixels = pixels.to(device)
+    use_bf16 = (
+        encoder_name == "vjepa2"
+        and getattr(device, "type", str(device).split(":")[0]) == "cuda"
+        and torch.cuda.is_bf16_supported()
+    )
+    with torch.inference_mode(), torch.autocast(
+        device_type="cuda",
+        dtype=torch.bfloat16,
+        enabled=use_bf16,
+    ):
         if encoder_name == "vjepa2":
             output = encoder(pixel_values_videos=pixels, skip_predictor=True)
             # V-JEPA has no CLS token. The official transfer setup learns an
@@ -382,6 +463,26 @@ def save_feature_cache(cache, result):
     partial.replace(cache)
 
 
+def save_feature_cache_stats(cache, result, encoder_name, args, elapsed_seconds):
+    """Persist timing metadata for an actual extraction (not a cache hit)."""
+    windows = int(result[0].shape[0])
+    cache.with_name(cache.name + ".stats.json").write_text(
+        json.dumps(
+            {
+                "encoder": encoder_name,
+                "window_frames": int(args.window_frames),
+                "stride_frames": int(args.stride_frames),
+                "feature_dimensionality": int(result[0].shape[1]),
+                "num_windows": windows,
+                "feature_extraction_seconds": float(elapsed_seconds),
+                "seconds_per_output_window": float(elapsed_seconds / windows),
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+
+
 def extract_video(video, cache, encoder, device, args, encoder_name):
     if cache.exists():
         saved = np.load(cache)
@@ -395,6 +496,10 @@ def extract_video(video, cache, encoder, device, args, encoder_name):
         raise RuntimeError(f"Invalid frame rate for {video}")
     total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
     total_seconds = total_frames / fps if total_frames > 0 else 0.0
+    target_fps = float(getattr(args, "target_fps", 0.0) or fps)
+    if target_fps <= 0 or target_fps > fps + 1e-3:
+        target_fps = fps
+    extraction_started = time.perf_counter()
 
     # Preserve each checkpoint's native spatial evaluation geometry.  V-JEPA2
     # was cached at 256px, while this VideoMAE checkpoint has a fixed 224px
@@ -407,6 +512,8 @@ def extract_video(video, cache, encoder, device, args, encoder_name):
     if encoder_name == "optical_flow":
         prev_gray = None
         flow_sequence = []
+        sampled_frame_index = -1
+        next_sample_time = 0.0
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -414,6 +521,11 @@ def extract_video(video, cache, encoder, device, args, encoder_name):
             frame_index += 1
             if args.max_seconds is not None and frame_index / fps >= args.max_seconds:
                 break
+            source_time = frame_index / fps
+            if source_time + (0.5 / fps) < next_sample_time:
+                continue
+            next_sample_time += 1.0 / target_fps
+            sampled_frame_index += 1
             frame_rgb = prepare_frame(frame)
             gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
             if prev_gray is not None:
@@ -434,10 +546,10 @@ def extract_video(video, cache, encoder, device, args, encoder_name):
         flow_sequence = np.asarray(flow_sequence, dtype=np.float32)
         flow_sequence = smooth_temporal_features(
             flow_sequence,
-            fps,
+            target_fps,
             smooth_seconds=args.flow_temporal_smooth,
         )
-        total_frames_seen = frame_index + 1
+        total_frames_seen = sampled_frame_index + 1
         window_pairs = args.window_frames - 1
         max_start = total_frames_seen - args.window_frames
         for start_frame in range(0, max_start + 1):
@@ -452,8 +564,8 @@ def extract_video(video, cache, encoder, device, args, encoder_name):
                 args,
             )
             features.append(feature)
-            starts.append(start_frame / fps)
-            ends.append((start_frame + args.window_frames) / fps)
+            starts.append(start_frame / target_fps)
+            ends.append((start_frame + args.window_frames) / target_fps)
             if len(starts) % 50 == 0:
                 progress = min(total_seconds, ends[-1]) if total_frames > 0 else 0.0
                 print(
@@ -467,6 +579,9 @@ def extract_video(video, cache, encoder, device, args, encoder_name):
             raise RuntimeError(f"No full windows found in {video}")
         result = (np.stack(features), np.asarray(starts), np.asarray(ends))
         save_feature_cache(cache, result)
+        save_feature_cache_stats(
+            cache, result, encoder_name, args, time.perf_counter() - extraction_started
+        )
         return result
 
     def flush():
@@ -474,19 +589,52 @@ def extract_video(video, cache, encoder, device, args, encoder_name):
             features.append(encode_batch(pending, encoder, device, encoder_name))
             pending.clear()
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        frame_index += 1
-        if args.max_seconds is not None and frame_index / fps >= args.max_seconds:
-            break
-        ring.append(prepare_frame(frame, size=input_size))
-        start_frame = frame_index - args.window_frames + 1
+    use_ffmpeg_pipe = (
+        encoder_name == "vjepa2"
+        and getattr(device, "type", str(device).split(":")[0]) == "cuda"
+        and os.environ.get("VJEPA_FFMPEG_PIPE", "1") != "0"
+        and args.max_seconds is None
+    )
+
+    def prepared_frames():
+        nonlocal frame_index
+        if use_ffmpeg_pipe:
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+            yield from ffmpeg_prepared_frames(
+                video, width, height, fps, target_fps, size=input_size
+            )
+            return
+        next_sample_time = 0.0
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                frame_index += 1
+                if (
+                    args.max_seconds is not None
+                    and frame_index / fps >= args.max_seconds
+                ):
+                    break
+                source_time = frame_index / fps
+                if source_time + (0.5 / fps) < next_sample_time:
+                    continue
+                next_sample_time += 1.0 / target_fps
+                yield prepare_frame(frame, size=input_size)
+        finally:
+            cap.release()
+
+    sampled_frame_index = -1
+    for prepared_frame in prepared_frames():
+        sampled_frame_index += 1
+        ring.append(prepared_frame)
+        start_frame = sampled_frame_index - args.window_frames + 1
         if len(ring) == args.window_frames and start_frame % args.stride_frames == 0:
             pending.append(np.stack(ring))
-            starts.append(start_frame / fps)
-            ends.append((start_frame + args.window_frames) / fps)
+            starts.append(start_frame / target_fps)
+            ends.append((start_frame + args.window_frames) / target_fps)
             if len(starts) % 50 == 0:
                 print(
                     f"  {video.name}: {ends[-1]:.1f}s / {total_seconds:.1f}s "
@@ -496,11 +644,13 @@ def extract_video(video, cache, encoder, device, args, encoder_name):
             if len(pending) == args.feature_batch_size:
                 flush()
     flush()
-    cap.release()
     if not features:
         raise RuntimeError(f"No full windows found in {video}")
     result = (np.concatenate(features), np.asarray(starts), np.asarray(ends))
     save_feature_cache(cache, result)
+    save_feature_cache_stats(
+        cache, result, encoder_name, args, time.perf_counter() - extraction_started
+    )
     return result
 
 
@@ -675,7 +825,10 @@ def main():
         video, intervals = read_annotation(annotation, positive_labels)
         if included is not None and video.name not in included:
             continue
-        if not video.exists():
+        # A final cached-only probe fit only needs the annotation and its
+        # exact feature cache.  Requiring the original video here forces an
+        # unnecessary copy of raw videos solely to train a lightweight probe.
+        if not video.exists() and not args.cached_only:
             raise FileNotFoundError(video)
         records.append((video, intervals))
         found_included.add(video.name)
@@ -747,9 +900,29 @@ def main():
     feature_loading_seconds = time.perf_counter() - feature_loading_started
     del model, encoder
 
+    if args.extract_only:
+        print(
+            json.dumps(
+                {
+                    "feature_extraction_complete": True,
+                    "videos": len(data),
+                    "feature_loading_seconds": feature_loading_seconds,
+                },
+                indent=2,
+            )
+        )
+        return
+
     videos = sorted(data)
     validation_parts = []
-    if args.fixed_train_videos is not None:
+    if args.fit_all:
+        train_videos = videos
+        val_videos = []
+        train_x = np.concatenate([data[v]["features"] for v in train_videos])
+        train_y = np.concatenate([data[v]["labels"] for v in train_videos])
+        val_x = val_y = None
+        split_scope = "all_labeled_videos_final_fit_no_heldout_evaluation"
+    elif args.fixed_train_videos is not None:
         train_videos = [
             line.strip() for line in args.fixed_train_videos.read_text().splitlines() if line.strip()
         ]
@@ -811,7 +984,9 @@ def main():
     # Fit normalization on training videos only.
     mean, std = train_x.mean(0), train_x.std(0) + 1e-6
     train_x = (train_x - mean) / std
-    val_x = (val_x - mean) / std
+    # A final --fit-all model deliberately has no validation partition.
+    if val_x is not None:
+        val_x = (val_x - mean) / std
 
     probes_to_train = []
     for name in probe_types:
@@ -835,15 +1010,21 @@ def main():
         training_started = time.perf_counter()
         if name == "rf":
             rf_model = fit_random_forest(train_x, train_y, args)
-            probabilities[name] = predict_random_forest(rf_model, val_x)
-            report[name] = metrics(val_y, probabilities[name])
+            if not args.fit_all:
+                probabilities[name] = predict_random_forest(rf_model, val_x)
+                report[name] = metrics(val_y, probabilities[name])
+            else:
+                report[name] = {"evaluation": "not_reported_final_model_fit_on_all_labeled_data"}
             report[name]["training_seconds"] = time.perf_counter() - training_started
             joblib_dump(rf_model, args.output_dir / f"{name}_probe.joblib")
             continue
 
         fit(probe, train_x, train_y, args, device)
-        probabilities[name] = predict(probe, val_x, device)
-        report[name] = metrics(val_y, probabilities[name])
+        if not args.fit_all:
+            probabilities[name] = predict(probe, val_x, device)
+            report[name] = metrics(val_y, probabilities[name])
+        else:
+            report[name] = {"evaluation": "not_reported_final_model_fit_on_all_labeled_data"}
         report[name]["training_seconds"] = time.perf_counter() - training_started
         torch.save(probe.cpu().state_dict(), args.output_dir / f"{name}_probe.pt")
 
