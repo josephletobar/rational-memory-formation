@@ -3,6 +3,7 @@
 # run the corrected three-encoder completion sequence.  The legacy verifier
 # is now strict, so it cannot publish a false-complete marker first.
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 LEGACY_PID="${1:?usage: $0 LEGACY_RUNNER_PID}"
 ROOT="/Volumes/Crucial X9/theory-of-mind/robustness_study"
@@ -12,4 +13,4 @@ done
 
 rm -f "$ROOT/ALL_LOCAL_CACHES_VERIFIED"
 cd "/Users/jleto/LocalProjects/theory-of-mind"
-exec ./run_full_cache_after_robustness.sh
+exec "$SCRIPT_DIR/run_full_cache_after_robustness.sh"

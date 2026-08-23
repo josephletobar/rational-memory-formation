@@ -2,6 +2,7 @@
 # Let the in-flight V-JEPA/flow run finish, then restart its matching
 # V-JEPA/flow-only completion sequence if recovery is needed.
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 OLD_PID="${1:?usage: $0 EXISTING_RUNNER_PID}"
 ROOT="/Volumes/Crucial X9/theory-of-mind/robustness_study"
@@ -14,4 +15,4 @@ done
 # pass succeeds, so clear any stale version before recovery.
 rm -f "$ROOT/ALL_LOCAL_CACHES_VERIFIED"
 cd "/Users/jleto/LocalProjects/theory-of-mind"
-exec ./run_full_cache_after_robustness.sh
+exec "$SCRIPT_DIR/run_full_cache_after_robustness.sh"

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Stream missing feature caches to the pod in small batches, then copy each
 # completed batch back to the Crucial X9 before freeing pod disk space.
@@ -181,7 +182,7 @@ if [[ ! -s "$MANIFEST" ]]; then
 fi
 
 rsync -a --no-owner --no-group -e "ssh -p $POD_PORT -i $POD_KEY" \
-  "$(dirname "$0")/cache_video_batch.py" \
+  "$REPO_ROOT/cache_video_batch.py" \
   "$POD_HOST:$REMOTE_REPO/cache_video_batch.py"
 
 USE_FULL_SOURCE=0
